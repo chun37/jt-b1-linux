@@ -12,7 +12,8 @@ APIや利用可能な機能は提供元の変更を受けます。
 ## Web APIのPKCE認証
 
 1. [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)で自分のWeb APIアプリを作成します。
-2. Redirect URIを`http://127.0.0.1:8768/callback`として登録します。`localhost`とは別の設定です。
+2. Redirect URIを`http://127.0.0.1:8768/callback`として登録します。
+   `localhost`とは別の設定です。
 3. `examples/spotify-client.example.json`をリポジトリ外へコピーし、自分のClient IDに置き換えます。
 4. PCのブラウザーが使える状態で、次の認証補助を起動します。
 5. `http://127.0.0.1:8768/`を開き、読み取り権限への同意を自分で確認します。
