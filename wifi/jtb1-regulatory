@@ -1,0 +1,21 @@
+#!/bin/sh
+# Respond to legacy cfg80211 requests using conservative, fixed JP rules.
+# Initial COUNTRY=00 must complete before the queued JP request can proceed.
+set -eu
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[ "$(id -u)" = 0 ]
+if iw reg get | grep -q '^country JP:'; then exit 0; fi
+PRELOAD='/usr/lib/libnl-3.so.200 /usr/lib/libnl-genl-3.so.200 /usr/local/libexec/jtb1-setreg-jp.so'
+JTB1_REG_COUNTRY=00 LD_PRELOAD="$PRELOAD" /bin/true || true
+sleep 1
+iw reg set JP
+n=0
+while [ "$n" -lt 5 ]; do
+ sleep 1
+ if JTB1_REG_COUNTRY=JP LD_PRELOAD="$PRELOAD" /bin/true; then
+  iw reg get
+  exit 0
+ fi
+ n=$((n+1))
+done
+exit 1

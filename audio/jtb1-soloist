@@ -1,0 +1,175 @@
+#!/bin/sh
+# Foreground manual service. No boot or Android/raw partition modifications.
+set -eu
+umask 077
+ulimit -c 0
+unset LD_PRELOAD LD_LIBRARY_PATH
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+BASE=/opt/jtb1-soloist
+R=/run/jtb1-soloist
+DATA=/var/lib/jtb1-soloist
+CACHE=/var/cache/jtb1-soloist
+KEY=/etc/jtb1-soloist/api-key
+export ALSA_CONFIG_DIR="$BASE/alsa"
+export ALSA_CONFIG_PATH="$BASE/alsa/alsa.conf"
+export ALSA_PLUGIN_DIR="$BASE/lib"
+export PULSE_RUNTIME_PATH="$R/pulse"
+export PULSE_STATE_PATH="$R/pulse/state"
+export PULSE_CONFIG_PATH="$R/pulse/config"
+export PULSE_CLIENTCONFIG="$R/client.conf"
+export PULSE_SERVER="unix:$R/pulse/native"
+run() { "$BASE/lib/ld-linux-armhf.so.3" --library-path "$BASE/lib" "$@"; }
+ctl() { run "$BASE/soloist" ctl "$@" -D "$DATA"; }
+case "${1:-run}" in
+ version) run "$BASE/soloist" --version; exit;;
+ status) ctl status; exit;;
+ ctl) shift; ctl "$@"; exit;;
+ pulse) shift; run "$BASE/bin/pactl" "$@"; exit;;
+ stop)
+  [ -f "$R/runner.pid" ] || exit 0
+  p=$(cat "$R/runner.pid")
+  case "$p" in ''|*[!0-9]*) exit 1;; esac
+  [ -r "/proc/$p/cmdline" ] || exit 0
+  tr '\000' '\n' <"/proc/$p/cmdline" | grep -Fxq /usr/local/sbin/jtb1-soloist
+  kill -TERM "$p"; exit;;
+ run) ;;
+ *) echo 'Usage: jtb1-soloist [run|version|status|ctl COMMAND|pulse COMMAND|stop]' >&2; exit 2;;
+esac
+[ "$(id -u)" -eq 0 ]
+[ "$(uname -r)" = '3.0.8+' ]
+[ -r "$KEY" ]
+if grep -Eq '^(cfgdrv|ddsync) ' /proc/modules; then
+ echo 'Refusing audio trial with cfgdrv/ddsync loaded' >&2; exit 1
+fi
+mkdir -p "$R" "$DATA" "$CACHE"
+chmod 700 "$R" "$DATA" "$CACHE"
+mkdir "$R/lock" || { echo 'Existing service lock; inspect before retrying' >&2; exit 1; }
+echo "$$" >"$R/runner.pid"
+rm -f "$R/router-stop"
+pulse=''
+soloist=''
+router=''
+routing=no
+mix() { run "$BASE/bin/amixer" -c 0 "$@"; }
+cleanup() {
+ trap - EXIT INT TERM HUP
+ # Cooperative stop: let any foreground mixer/RPC child finish and be
+ # reaped before this process becomes the sole route writer again.
+ if [ -n "$router" ]; then
+  : >"$R/router-stop"
+  wait "$router" 2>/dev/null || true
+ fi
+ if [ "$routing" = yes ]; then
+  mix cset 'name=Alt Headset Playback Volume' 0 >/dev/null 2>&1 || true
+  mix cset 'name=Alt Handsfree Playback Volume' 0 >/dev/null 2>&1 || true
+ fi
+ if [ -n "$soloist" ]; then kill -TERM "$soloist" 2>/dev/null || true; wait "$soloist" 2>/dev/null || true; fi
+ if [ -n "$pulse" ]; then kill -TERM "$pulse" 2>/dev/null || true; wait "$pulse" 2>/dev/null || true; fi
+ if [ "$routing" = yes ]; then
+  mix cset 'name=HS Left Playback' 0 >/dev/null 2>&1 || true
+  mix cset 'name=HS Right Playback' 0 >/dev/null 2>&1 || true
+  mix cset 'name=Headset Playback Volume' 0,0 >/dev/null 2>&1 || true
+  mix cset 'name=DL1 Mixer Multimedia' 0 >/dev/null 2>&1 || true
+  mix cset 'name=DL1 PDM Switch' 0 >/dev/null 2>&1 || true
+  mix cset 'name=Sidetone Mixer Playback' 0 >/dev/null 2>&1 || true
+  mix cset 'name=DL1 Media Playback Volume' 0 >/dev/null 2>&1 || true
+  mix cset 'name=Handsfree Playback Volume' 0,0 >/dev/null 2>&1 || true
+  mix cset 'name=HF Left Playback' 0 >/dev/null 2>&1 || true
+  mix cset 'name=HF Right Playback' 0 >/dev/null 2>&1 || true
+  mix cset 'name=DL2 Mixer Multimedia' 0 >/dev/null 2>&1 || true
+  mix cset 'name=DL2 Media Playback Volume' 0 >/dev/null 2>&1 || true
+ fi
+ echo stopped >"$R/state"
+ rm -f "$R/runner.pid" "$R/soloist.pid" "$R/pulse.pid" "$R/router.pid" "$R/router-stop"
+ rmdir "$R/lock" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT HUP
+mix cget 'name=DL2 Mixer Multimedia' | grep -Fxq '  : values=off'
+for name in 'DL2 Media Playback Volume' 'HF Left Playback' 'HF Right Playback'; do
+ mix cget "name=$name" | grep -Fxq '  : values=0'
+done
+mix cget 'name=Handsfree Playback Volume' | grep -Fxq '  : values=0,0'
+mix cget 'name=Alt Handsfree Playback Volume' | grep -Fxq '  : values=0'
+for name in 'HS Left Playback' 'HS Right Playback' 'Alt Headset Playback Volume' 'DL1 Media Playback Volume'; do
+ mix cget "name=$name" | grep -Fxq '  : values=0'
+done
+for name in 'DL1 Mixer Multimedia' 'DL1 PDM Switch' 'Sidetone Mixer Playback'; do
+ mix cget "name=$name" | grep -Fxq '  : values=off'
+done
+mix cget 'name=Headset Playback Volume' | grep -Fxq '  : values=0,0'
+select_route() {
+ case "$1" in
+  0) printf 'speaker\n';;
+  1|2) printf 'headphones\n';;
+  *) echo 'Unknown jack state; refusing output' >&2; return 1;;
+ esac
+}
+jack_state=$(cat /sys/class/switch/h2w/state)
+route=$(select_route "$jack_state")
+[ -x /usr/local/libexec/jtb1-audio-watch ]
+# Ask for the highest supported streaming tier. This preference is a ceiling,
+# not evidence of the format the server actually delivers (MA server PR 5882).
+mkdir -p "$DATA/settings"
+for f in "$DATA/settings/prefs" "$DATA"/settings/Users/*/prefs; do
+ [ -f "$f" ] || { [ "$f" = "$DATA/settings/prefs" ] || continue; : >"$f"; }
+ [ -e "$f.pre-jtb1-quality" ] || cp -p "$f" "$f.pre-jtb1-quality"
+ awk -F= '$1!="audio.play_bitrate_enumeration" && $1!="audio.play_bitrate_non_metered_enumeration" && $1!="audio.play_bitrate_non_metered_migrated"' "$f" >"$f.tmp"
+ printf '%s\n' 'audio.play_bitrate_enumeration=5' 'audio.play_bitrate_non_metered_enumeration=5' 'audio.play_bitrate_non_metered_migrated=true' >>"$f.tmp"
+ chmod 600 "$f.tmp"
+ mv "$f.tmp" "$f"
+done
+cat >"$R/client.conf" <<'EOF'
+autospawn = no
+enable-shm = no
+enable-memfd = no
+EOF
+mkdir -p "$PULSE_RUNTIME_PATH" "$PULSE_STATE_PATH" "$PULSE_CONFIG_PATH"
+routing=yes
+if [ "$route" = headphones ]; then
+ # Start with 10 dB of additional DL1 digital attenuation. Do not change
+ # Headset Power Mode. Speaker routing remains at the verified off baseline.
+ mix cset 'name=DL1 Media Playback Volume' 110 >/dev/null
+ # Match the driver's shadow target to the vendor enum's 0x66 register gain.
+ mix cset 'name=Headset Playback Volume' 9,9 >/dev/null
+ mix cset 'name=HS Left Playback' 'HS DAC' >/dev/null
+ mix cset 'name=HS Right Playback' 'HS DAC' >/dev/null
+ # Saved kernel intercon: DL1 Mixer -> Sidetone Mixer -> DL1 PDM.
+ # This is playback only; never enable Sidetone Mixer Capture.
+ mix cset 'name=Sidetone Mixer Playback' 1 >/dev/null
+ mix cset 'name=DL1 PDM Switch' 1 >/dev/null
+ mix cset 'name=DL1 Mixer Multimedia' 1 >/dev/null
+ mix cset 'name=Alt Headset Playback Volume' 'Volume for MultiMedia' >/dev/null
+else
+mix cset 'name=DL2 Media Playback Volume' 120 >/dev/null
+mix cset 'name=Handsfree Playback Volume' 16,16 >/dev/null
+mix cset 'name=HF Left Playback' 1 >/dev/null
+mix cset 'name=HF Right Playback' 1 >/dev/null
+mix cset 'name=DL2 Mixer Multimedia' 1 >/dev/null
+# Required vendor music policy: ordinary volume only updates a shadow value.
+# cfgdrv callbacks are absent; enum=1 uses the verified fallback codec gains.
+# Keep Soloist volume low. Do not assume the ordinary gain of 16 is applied.
+mix cset 'name=Alt Handsfree Playback Volume' 'Volume for MultiMedia' >/dev/null
+fi
+printf '%s\n' "$route" >"$R/output"
+printf '%s\n' "$jack_state" >"$R/jack-state"
+# Direct child process, so cleanup can terminate and reap the actual server.
+"$BASE/lib/ld-linux-armhf.so.3" --library-path "$BASE/lib" "$BASE/bin/pulseaudio" --daemonize=no --exit-idle-time=-1 --disable-shm=true --use-pid-file=no --disallow-exit=true --log-target=stderr -n -p "$BASE/modules" --load='module-alsa-sink device=hw:0,0 sink_name=jtb1_speaker rate=44100 channels=2 format=s32le tsched=0' --load="module-native-protocol-unix socket=$R/pulse/native auth-anonymous=1" >"$R/pulse.log" 2>&1 &
+pulse=$!
+echo "$pulse" >"$R/pulse.pid"
+for i in 1 2 3 4 5; do [ -S "$R/pulse/native" ] && break; sleep 1; done
+kill -0 "$pulse"
+run "$BASE/bin/pactl" set-default-sink jtb1_speaker
+"$BASE/lib/ld-linux-armhf.so.3" --library-path "$BASE/lib" "$BASE/soloist" --device-name JT-B1 --api-key "$(cat "$KEY")" --initial-volume 20 --cache-size 100 --data-dir "$DATA" --cache-dir "$CACHE" --ws 127.0.0.1:0 >"$R/soloist.log" 2>&1 &
+soloist=$!
+echo "$soloist" >"$R/soloist.pid"
+echo running >"$R/state"
+/usr/local/libexec/jtb1-audio-watch >"$R/router.log" 2>&1 &
+router=$!
+echo "$router" >"$R/router.pid"
+while kill -0 "$soloist" 2>/dev/null && kill -0 "$router" 2>/dev/null; do sleep 1; done
+if ! kill -0 "$router" 2>/dev/null; then
+ echo 'Route watcher stopped; disabling playback' >&2
+ exit 1
+fi
+wait "$soloist"

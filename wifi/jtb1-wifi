@@ -1,0 +1,54 @@
+#!/bin/sh
+# Isolated Wi-Fi supervisor for BusyBox init. Never expose ADB over TCP.
+set -eu
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MODULES=/lib/modules/3.0.8+/jtb1
+CONF=/etc/wpa_supplicant/wpa_supplicant.conf
+[ "$(id -u)" = 0 ]
+[ -s "$CONF" ] || { sleep 30; exit 1; }
+for m in compat cfg80211 mac80211 wl12xx wl12xx_sdio; do
+ if ! grep -q "^$m " /proc/modules; then
+  insmod "$MODULES/$m.ko" || { sleep 30; exit 1; }
+ fi
+done
+/usr/local/sbin/jtb1-regulatory > /run/jtb1-regulatory.log 2>&1 || { sleep 30; exit 1; }
+mac=$(cat /etc/jtb1-wifi/mac-address)
+if [ "$(cat /sys/class/net/wlan0/address)" != "$mac" ]; then
+ ip link set wlan0 down
+ ip link set wlan0 address "$mac"
+fi
+ip link set wlan0 up
+# Scope workaround strictly to this process, not system-wide ld.so settings.
+LD_PRELOAD=/usr/local/libexec/jtb1-nl-scan-compat.so wpa_supplicant -Dnl80211 -iwlan0 -c"$CONF" > /run/jtb1-wifi.log 2>&1 &
+wp=$!
+dhcp=''
+cleanup() {
+ [ -z "$dhcp" ] || kill "$dhcp" 2>/dev/null || true
+ kill "$wp" 2>/dev/null || true
+ [ -z "$dhcp" ] || wait "$dhcp" 2>/dev/null || true
+ wait "$wp" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+while kill -0 "$wp" 2>/dev/null; do
+ state=$(wpa_cli -iwlan0 status 2>/dev/null | awk -F= '$1=="wpa_state" {print $2}' || true)
+ # The stock driver can reset the regulatory domain on disconnection.
+ if [ "$state" != COMPLETED ]; then
+  /usr/local/sbin/jtb1-regulatory >> /run/jtb1-regulatory.log 2>&1 || true
+ fi
+ if [ "$state" = COMPLETED ]; then
+  if [ -z "$dhcp" ] || ! kill -0 "$dhcp" 2>/dev/null; then
+   udhcpc -f -i wlan0 -p /run/jtb1-wifi-udhcpc.pid -t 5 -T 4 > /run/jtb1-wifi-dhcp.log 2>&1 &
+   dhcp=$!
+  fi
+ elif [ -n "$dhcp" ]; then
+  kill "$dhcp" 2>/dev/null || true
+  wait "$dhcp" 2>/dev/null || true
+  dhcp=''
+  ip -4 addr flush dev wlan0
+ fi
+ sleep 3
+done
+wait "$wp" || true
+sleep 10
+exit 1

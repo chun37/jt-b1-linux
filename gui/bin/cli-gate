@@ -1,0 +1,6 @@
+#!/bin/sh
+# The caller publishes a PID/start-time lease before releasing this gate.
+set -eu
+IFS= read -r ready
+[ "$ready" = GO ]
+exec /usr/local/sbin/jtb1-soloist ctl "$@"

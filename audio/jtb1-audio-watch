@@ -1,0 +1,148 @@
+#!/bin/sh
+# Supervised by jtb1-soloist. No modules, NVM, capture, or startup changes.
+set -eu
+umask 077
+unset LD_PRELOAD LD_LIBRARY_PATH
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+BASE=/opt/jtb1-soloist
+R=/run/jtb1-soloist
+JACK=/sys/class/switch/h2w/state
+export ALSA_CONFIG_DIR="$BASE/alsa"
+export ALSA_CONFIG_PATH="$BASE/alsa/alsa.conf"
+export ALSA_PLUGIN_DIR="$BASE/lib"
+export PULSE_RUNTIME_PATH="$R/pulse"
+export PULSE_CLIENTCONFIG="$R/client.conf"
+export PULSE_SERVER="unix:$R/pulse/native"
+[ "$(id -u)" -eq 0 ]
+limited_run() { /bin/busybox timeout -s TERM 5 "$BASE/lib/ld-linux-armhf.so.3" --library-path "$BASE/lib" "$@"; }
+ctl() { limited_run "$BASE/soloist" ctl "$@" -D /var/lib/jtb1-soloist; }
+pulse() { limited_run "$BASE/bin/pactl" "$@"; }
+mix() { limited_run "$BASE/bin/amixer" -c 0 cset "name=$1" "$2" >/dev/null; }
+select_route() {
+ case "$1" in
+  0) printf 'speaker\n';;
+  1|2) printf 'headphones\n';;
+  *) return 1;;
+ esac
+}
+off() {
+ mix 'Alt Headset Playback Volume' 0
+ mix 'Alt Handsfree Playback Volume' 0
+ mix 'HS Left Playback' 0
+ mix 'HS Right Playback' 0
+ mix 'Headset Playback Volume' 0,0
+ mix 'HF Left Playback' 0
+ mix 'HF Right Playback' 0
+ mix 'Handsfree Playback Volume' 0,0
+ mix 'DL1 Mixer Multimedia' 0
+ mix 'DL1 PDM Switch' 0
+ mix 'Sidetone Mixer Playback' 0
+ mix 'DL1 Media Playback Volume' 0
+ mix 'DL2 Mixer Multimedia' 0
+ mix 'DL2 Media Playback Volume' 0
+}
+apply() {
+ case "$1" in
+  headphones)
+   mix 'DL1 Media Playback Volume' 110
+   mix 'Headset Playback Volume' 9,9
+   mix 'HS Left Playback' 'HS DAC'
+   mix 'HS Right Playback' 'HS DAC'
+   mix 'Sidetone Mixer Playback' 1
+   mix 'DL1 PDM Switch' 1
+   mix 'DL1 Mixer Multimedia' 1
+   mix 'Alt Headset Playback Volume' 'Volume for MultiMedia'
+   ;;
+  speaker)
+   mix 'DL2 Media Playback Volume' 120
+   mix 'Handsfree Playback Volume' 16,16
+   mix 'HF Left Playback' 1
+   mix 'HF Right Playback' 1
+   mix 'DL2 Mixer Multimedia' 1
+   mix 'Alt Handsfree Playback Volume' 'Volume for MultiMedia'
+   ;;
+  *) return 1;;
+ esac
+}
+failed() {
+ code=$?
+ trap - EXIT INT TERM HUP
+ rm -f "$R/volume-lock-ready"
+ if [ "$code" -ne 0 ]; then
+  # Keep the sink closed even if a control/RPC failed. Parent also cleans up.
+  pulse suspend-sink jtb1_speaker 1 >/dev/null 2>&1 || true
+  ctl pause >/dev/null 2>&1 || true
+  # Do not stop best-effort muting on the first control error.
+  set +e
+  off
+  printf 'failed\n' >"$R/router-state"
+  printf 'off\n' >"$R/output"
+  printf 'route watcher failed (%s); output disabled\n' "$code" >&2
+ fi
+ exit "$code"
+}
+trap failed EXIT
+trap 'exit 0' TERM INT HUP
+# Share this open-file-description lock with GUI volume RPCs so route
+# changes cannot overlap a concurrent GUI volume write.
+exec 9>"$R/volume-route.lock"
+/bin/busybox flock -u 9
+printf '%s\n' "$$" >"$R/volume-lock-ready"
+last=$(cat "$R/jack-state")
+printf 'watching\n' >"$R/router-state"
+while :; do
+ [ ! -e "$R/router-stop" ] || exit 0
+ raw=$(cat "$JACK")
+ if [ "$raw" = "$last" ]; then sleep 0.25; continue; fi
+ /bin/busybox timeout -s TERM 8 /bin/busybox flock -x 9
+ raw=$(cat "$JACK")
+ if [ "$raw" = "$last" ]; then /bin/busybox flock -u 9; continue; fi
+ old_route=$(cat "$R/output")
+ new_route=$(select_route "$raw") || new_route=off
+ # A 1<->2 classification change does not change the physical output.
+ if [ "$new_route" = "$old_route" ]; then
+  printf '%s\n' "$raw" >"$R/jack-state"
+  last=$raw
+  /bin/busybox flock -u 9
+  continue
+ fi
+ # Close ALSA before moving its DPCM route. No source playback can reach
+ # a newly enabled speaker before pause has been acknowledged.
+ pulse suspend-sink jtb1_speaker 1 >/dev/null
+ ctl now --json >"$R/route-playback-state.json"
+ playing=no
+ if grep -Eq '"status"[[:space:]]*:[[:space:]]*"playing"' "$R/route-playback-state.json"; then playing=yes; fi
+ ctl pause >/dev/null
+ off
+ sleep 0.15
+ raw=$(cat "$JACK")
+ new_route=$(select_route "$raw")
+ # AUX/headphones and speaker both allow 0..100. Validate but preserve
+ # the selected volume across route changes; unplug still pauses below.
+ volume=$(awk 'match($0,/"volume"[[:space:]]*:[[:space:]]*[0-9]+/) {v=substr($0,RSTART,RLENGTH); sub(/.*:/,"",v); gsub(/[[:space:]]/,"",v); print v; exit}' "$R/route-playback-state.json")
+ case "$volume" in ''|*[!0-9]*) exit 1;; esac
+ [ "$volume" -le 100 ]
+ [ ! -e "$R/router-stop" ] || exit 0
+ apply "$new_route"
+ # If the jack bounced during configuration, stay silent and retry.
+ if [ "$(cat "$JACK")" != "$raw" ]; then
+  off
+  printf 'off\n' >"$R/output"
+  last=retry
+  /bin/busybox flock -u 9
+  continue
+ fi
+ printf '%s\n' "$new_route" >"$R/output.tmp"
+ mv "$R/output.tmp" "$R/output"
+ printf '%s\n' "$raw" >"$R/jack-state"
+ last=$raw
+ [ ! -e "$R/router-stop" ] || exit 0
+ pulse suspend-sink jtb1_speaker 0 >/dev/null
+ # Unplug ALWAYS remains paused. Insertion resumes only previously playing
+ # audio. A bounced removal is conservatively left paused as well.
+ if [ "$new_route" = headphones ] && [ "$old_route" = speaker ] && [ "$playing" = yes ]; then
+  ctl play >/dev/null
+ fi
+ /bin/busybox flock -u 9
+ printf 'route=%s jack=%s playing_before=%s\n' "$new_route" "$raw" "$playing"
+done

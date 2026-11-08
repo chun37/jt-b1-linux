@@ -1,0 +1,68 @@
+#!/bin/sh
+# Match the saved 09.0101 BatteryService$Led policy and lights.omap4 HAL.
+# Battery inputs only; never writes charger settings, raw devices, or triggers.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+policy() {
+ status=$1 health=$2 level=$3
+ case "$level" in ''|*[!0-9]*) level=101;; esac
+ if [ "$health" = Overheat ]; then
+  echo '154 154 0 125 2875 10131968'
+ elif [ "$level" -lt 15 ] && [ "$status" != Charging ]; then
+  echo '255 0 0 0 0 16711680'
+ elif [ "$status" = Full ]; then
+  echo '0 255 0 0 0 65280'
+ elif [ "$status" = Charging ]; then
+  echo '154 154 0 0 0 10131968'
+ else
+  echo '0 0 0 0 0 0'
+ fi
+}
+# Pure policy entry for host-side tests. No hardware access in this mode.
+if [ "${1:-}" = --policy ] && [ "$#" -eq 4 ]; then
+ policy "$2" "$3" "$4"
+ exit
+fi
+case "${1:-}" in ''|--once) ;; *) exit 2;; esac
+read_attr() { cat "$1" 2>/dev/null || echo Unknown; }
+write_changed() {
+ current=$(cat "$1") || return 1
+ if [ "$current" != "$2" ]; then printf '%s\n' "$2" > "$1" || return 1; changed=1; fi
+}
+apply() {
+ # Component writes update the vendor driver's cache; color commits it.
+ # Unlike trigger=none, brightness writes do not unregister beryl_slope
+ # in this vendor kernel (verified led_brightness_store disassembly).
+ changed=0
+ write_changed /sys/class/leds/red/brightness "$1" &&
+ write_changed /sys/class/leds/green/brightness "$2" &&
+ write_changed /sys/class/leds/blue/brightness "$3" &&
+ write_changed /sys/class/leds/red/delay_on "$4" &&
+ write_changed /sys/class/leds/red/delay_off "$5" || return 1
+ current=$(cat /sys/class/leds/color/brightness) || return 1
+ if [ "$changed" = 1 ] || [ "$current" != "$6" ]; then
+  printf '%s\n' "$6" > /sys/class/leds/color/brightness || return 1
+  changed=1
+ fi
+}
+last=
+while :; do
+ if [ -f /run/jtb1-display-ready ]; then
+  status=$(read_attr /sys/class/power_supply/smb137c/status)
+  health=$(read_attr /sys/class/power_supply/smb137c/health)
+  level=$(read_attr /sys/class/power_supply/battery/capacity)
+  choice=$(policy "$status" "$health" "$level")
+  # Reconcile actual sysfs values even when battery state is unchanged.
+  # Startup kernel work may reset a component after the first successful write.
+  # policy emits exactly six unsigned integers, never shell commands.
+  if apply $choice; then
+   if [ "$choice" != "$last" ] || [ "$changed" = 1 ]; then
+    printf 'status=%s health=%s capacity=%s led=%s repaired=%s\n' "$status" "$health" "$level" "$choice" "$changed" >> /run/jtb1-battery-led.log
+   fi
+   last=$choice
+  else
+   echo 'LED update failed; will retry' >> /run/jtb1-battery-led.log
+  fi
+ fi
+ [ "${1:-}" != --once ] || break
+ sleep 2
+done

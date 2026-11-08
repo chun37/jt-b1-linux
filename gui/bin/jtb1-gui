@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+umask 077
+ulimit -c 0
+unset LD_PRELOAD LD_LIBRARY_PATH
+exec /opt/jtb1-gui/bin/jtb1-gui-python /opt/jtb1-gui/app/gui_control.py "${1:-run}"

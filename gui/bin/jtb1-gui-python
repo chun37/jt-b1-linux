@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+BASE=/opt/jtb1-gui
+export PYTHONHOME="$BASE/runtime/usr"
+export PYTHONPATH="$BASE/app"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONSAFEPATH=1
+export PYTHONIOENCODING=utf-8
+export LANG=C.UTF-8
+export SSL_CERT_FILE=/etc/ssl/cert.pem
+unset LD_PRELOAD LD_LIBRARY_PATH PYTHONSTARTUP PYTHONINSPECT
+exec "$BASE/runtime/lib/ld-musl-armhf.so.1" --library-path "$BASE/runtime/lib:$BASE/runtime/usr/lib" "$BASE/runtime/usr/bin/python3" "$@"
