@@ -3,7 +3,8 @@
 ## この手順で行わないこと
 
 この説明は、すでに純正3.0.8+からAlpineを起動できるJT-B1を対象にします。
-Androidからのroot取得、bootargsの変更、p22へのrootfs書き込み、SIMロック解除は扱いません。
+この配置手順ではAndroidからのroot取得、bootargsの変更、p22へのrootfs書き込み、SIMロック解除は扱いません。
+root取得とSIMロック解除の研究コードは[research/README.md](../research/README.md)を参照してください。
 別機種へコピーする手順でもありません。
 
 `tools/stage.py`はPCの新しいディレクトリーへソースを並べるだけです。
